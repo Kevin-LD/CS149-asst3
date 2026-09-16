@@ -26,6 +26,12 @@ LDFLAGS=-L/usr/local/cuda/lib64/ -lcudart
 NVCC=nvcc
 NVCCFLAGS=-O3 -m64
 
+# debugging
+ifdef DEBUG
+    CXXFLAGS=-O0 -g -Wall
+    NVCCFLAGS=-O0 -g -G -m64
+endif
+
 
 OBJS=$(OBJDIR)/main.o  $(OBJDIR)/scan.o
 

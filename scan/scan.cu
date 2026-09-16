@@ -42,6 +42,27 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
+
+__global__ void upsweep_parfor_kernel(int *result, int two_d, int num_total_threads) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= num_total_threads)
+        return;
+    int two_dplus1 = 2*two_d;
+    int i = index*two_dplus1;
+    result[i+two_dplus1-1] += result[i+two_d-1];
+}
+
+__global__ void downsweep_parfor_kernel(int *result, int two_d, int num_total_threads) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= num_total_threads)
+        return;
+    int two_dplus1 = 2*two_d;
+    int i = index*two_dplus1;
+    int t = result[i+two_d-1];
+    result[i+two_d-1] = result[i+two_dplus1-1];
+    result[i+two_dplus1-1] += t;
+}
+
 void exclusive_scan(int* input, int N, int* result)
 {
 
@@ -54,8 +75,29 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    N = nextPow2(N);
 
+    // upsweep phase
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        // 有点重复计算
+        int two_dplus1 = 2*two_d;
+        int num_total_threads = N/two_dplus1;
+        int num_total_blocks = (num_total_threads + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK;
+        upsweep_parfor_kernel<<<num_total_blocks, THREADS_PER_BLOCK>>>(result, two_d, num_total_threads);
+    }
+
+    cudaMemset(result + N - 1, 0, sizeof(int));
+
+    // downsweep phase
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        int num_total_threads = N/two_dplus1;
+        int num_total_blocks = (num_total_threads + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK;
+        downsweep_parfor_kernel<<<num_total_blocks, THREADS_PER_BLOCK>>>(result, two_d, num_total_threads);
+    }
 }
+
+
 
 
 //
@@ -147,6 +189,24 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 // indices `i` for which `device_input[i] == device_input[i+1]`.
 //
 // Returns the total number of pairs found
+
+__global__ void make_flag(int *device_input, int *device_flag, int num_threads) {
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    if (index >= num_threads)
+        return;
+    device_flag[index] = (int)(device_input[index] == device_input[index+1]);
+}
+
+__global__ void write_output(int *device_flag, int *device_num_prior_repeats, int *device_output, int num_threads) {
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    if (index >= num_threads)
+        return;
+    // device_flag[index] == 1
+    if (device_flag[index]) {
+        device_output[device_num_prior_repeats[index]] = index;
+    }
+}
+
 int find_repeats(int* device_input, int length, int* device_output) {
 
     // CS149 TODO:
@@ -161,7 +221,33 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    int *device_flag;
+    int *device_num_prior_repeats;
+    int rounded_length = nextPow2(length);
+    cudaMalloc((void **) &device_flag, rounded_length*sizeof(int));
+    cudaMalloc((void **) &device_num_prior_repeats, rounded_length*sizeof(int));
+
+    int num_threads = length - 1;
+    int num_blocks = (num_threads + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK;
+    
+    make_flag<<<num_blocks, THREADS_PER_BLOCK>>>(device_input, device_flag, num_threads);
+
+    // in-place scan
+    cudaMemcpy(device_num_prior_repeats, device_flag, length*sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusive_scan(device_flag, length, device_num_prior_repeats);
+
+    num_threads = length;
+    num_blocks = (num_threads + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK;
+
+    write_output<<<num_blocks, THREADS_PER_BLOCK>>>(device_flag, device_num_prior_repeats, device_output, num_threads);
+
+    int last_flag;
+    int last_num_prior_repeats;
+
+    cudaMemcpy(&last_flag, device_flag + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&last_num_prior_repeats, device_num_prior_repeats + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    
+    return last_flag + last_num_prior_repeats; 
 }
 
 
