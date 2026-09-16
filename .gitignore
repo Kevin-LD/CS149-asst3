@@ -1,1 +1,5 @@
+# IDE
 .vscode/
+
+# logs
+scan/logs/
