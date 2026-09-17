@@ -3,3 +3,9 @@
 
 # logs
 scan/logs/
+render/logs/
+
+render/objs/
+
+# tmp
+tmp/
