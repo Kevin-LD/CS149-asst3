@@ -97,9 +97,9 @@ def get_time(render_cmd, scene):
         result = subprocess.run([cmd_string], shell=True, capture_output=True)
 
     # Extract the time taken
-    print("returncode:", result.returncode)
-    print("stdout:", result.stdout)
-    print("stderr:", result.stderr)
+    # print("returncode:", result.returncode)
+    # print("stdout:", result.stdout)
+    # print("stderr:", result.stderr)
     time = float(re.search(r"\d+\.\d+", str(result.stdout)).group())
     return time
 

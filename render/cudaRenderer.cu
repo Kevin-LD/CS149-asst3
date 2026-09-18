@@ -22,12 +22,15 @@
 #include <thrust/device_ptr.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/sort.h>
 
 
 // Debugging CUDA code is a pain.  The CUDA runtime does not throw exceptions or otherwise report errors in a way that is easy to catch.  The
 // following macro and function are a simple way to check for errors after each CUDA call.  If an error is detected, the program will print out the error and exit.  This is not a good way to handle errors in production code, but it is a simple way to catch errors during development.  See
 // https://stackoverflow.com/questions/14038589/how-to-check-for-errors-using-the-cuda-runtime-api for more information.
-#define DEBUG
+
+// #define DEBUG
 
 #ifdef DEBUG
 #define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
@@ -460,82 +463,133 @@ __global__ void kernelRenderCircles() {
 }
 
 // My code
-
-// kernalMakeFlags -- (CUDA device code)
+// kernelMakeTileCount -- (CUDA device code)
 //
-// Find whether each tile-circle pair intersect
-__global__ void kernelMakeFlags(int tileNumX, int2 tileSize, int *devFlag) {
+// find number of tiles intersecting with each circle
+__global__ void kernelMakeTileCount(int *devTileCount) {
     int circleIdx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (circleIdx >= cuConstRendererParams.numCircles)
+
+    if (circleIdx >= cuConstRendererParams.numCircles + 1)
         return;
-    int tileIdx = blockIdx.z * tileNumX + blockIdx.y;
 
-    int index = tileIdx*cuConstRendererParams.numCircles + circleIdx;
+    if (circleIdx == cuConstRendererParams.numCircles) {
+        devTileCount[0] = 0;
+        return;
+    }
 
-    int circlIdx3 = 3 * circleIdx;
+    int circleIdx3 = circleIdx*3;
 
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[circlIdx3]);
+    // float3 竟然是 4 Byte-align 的，非常神奇
+    // 不能用 float2，float2 要求 8 Byte-align
+    float3 p = *(float3*)&cuConstRendererParams.position[circleIdx3];
     float rad = cuConstRendererParams.radius[circleIdx];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    short minTileIdxX = screenMinX/TILE_SIZE;
+    short minTileIdxY = screenMinY/TILE_SIZE;
+    short maxTileIdxX = (screenMaxX + TILE_SIZE - 1) / TILE_SIZE;;
+    short maxTileIdxY = (screenMaxY + TILE_SIZE - 1) / TILE_SIZE;
 
     float invWidth = 1.f / cuConstRendererParams.imageWidth;
     float invHeight = 1.f / cuConstRendererParams.imageHeight;
 
-    float tileL = (blockIdx.y * tileSize.x) * invWidth;
-    float tileR = (blockIdx.y+1) * tileSize.x * invWidth;
-    float tileB = blockIdx.z * tileSize.y * invHeight;
-    float tileT = (blockIdx.z+1) * tileSize.y * invHeight;
+    int count = 0;
 
-    // shortcut
-    if (circleInBoxConservative(p.x, p.y, rad, tileL, tileR, tileT, tileB) && circleInBox(p.x, p.y, rad, tileL, tileR, tileT, tileB)) {
-        devFlag[index] = 1;
-    } else {
-        devFlag[index] = 0;
+    for (int i = minTileIdxX; i < maxTileIdxX; i++) {
+        float tileL = (i * TILE_SIZE) * invWidth;
+        float tileR = (i+1) * TILE_SIZE * invWidth;
+        for (int j = minTileIdxY; j < maxTileIdxY; j++) {
+            float tileB = j * TILE_SIZE * invHeight;
+            float tileT = (j+1) * TILE_SIZE * invHeight;
+            if (circleInBox(p.x, p.y, rad, tileL, tileR, tileT, tileB)) {
+                count++;
+            }
+        }
     }
+
+    // only access global memory once
+    devTileCount[circleIdx + 1] = count;
 }
 
-
-// kernalMakeLists -- (CUDA device code)
-//
-// turn flags into compact lists
-__global__ void kernelMakeLists(int tileNumX, int *devFlags, int *devScan, int * devLists) {
+__global__ void kernelWritePairs(int *devTileLists, int *devCircleLists, int *devTileOffSets, int numTileX) {
+    // 复用的这一段可以考虑用 inline 封装
     int circleIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
     if (circleIdx >= cuConstRendererParams.numCircles)
         return;
-    int tileIdx = blockIdx.z * tileNumX + blockIdx.y;
 
-    int base = tileIdx*cuConstRendererParams.numCircles;
+    int circleIdx3 = circleIdx*3;
 
-    int index = base + circleIdx;
-    if (devFlags[index]) {
-        devLists[base + devScan[index]] = circleIdx;
+    // float3 竟然是 4 Byte-align 的，非常神奇
+    // 不能用 float2，float2 要求 8 Byte-align
+    float3 p = *(float3*)&cuConstRendererParams.position[circleIdx3];
+    float rad = cuConstRendererParams.radius[circleIdx];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    short minTileIdxX = screenMinX/TILE_SIZE;
+    short minTileIdxY = screenMinY/TILE_SIZE;
+    short maxTileIdxX = (screenMaxX + TILE_SIZE - 1) / TILE_SIZE;;
+    short maxTileIdxY = (screenMaxY + TILE_SIZE - 1) / TILE_SIZE;
+
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+
+    int base = devTileOffSets[circleIdx];
+
+    for (int i = minTileIdxX; i < maxTileIdxX; i++) {
+        float tileL = (i * TILE_SIZE) * invWidth;
+        float tileR = (i+1) * TILE_SIZE * invWidth;
+        for (int j = minTileIdxY; j < maxTileIdxY; j++) {
+            float tileB = j * TILE_SIZE * invHeight;
+            float tileT = (j+1) * TILE_SIZE * invHeight;
+            if (circleInBox(p.x, p.y, rad, tileL, tileR, tileT, tileB)) {
+                devTileLists[base] = j * numTileX + i;
+                devCircleLists[base] = circleIdx;
+                base++;
+            }
+        }
     }
 }
 
-// kernalMakeListsLength -- (CUDA device code)
-//
-// find list length
-__global__ void kernelMakeListsLength(int tileNum, int *devFlags, int *devScan, int *devListsLength) {
-    int tileIdx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (tileIdx >= tileNum)
-        return;
-    int index = tileIdx * cuConstRendererParams.numCircles + cuConstRendererParams.numCircles - 1;
-    devListsLength[tileIdx] = devFlags[index] + devScan[index];
-}
 
-// kernalBlendPixels -- (CUDA device code)
-//
-// Blend Pixel according to List
-__global__ void kernelBlendPixels(int tileNumX, int *devLists, int *devListsLength) {
+__global__ void kernelBlendPixelsByStartsEnds(int numTileX, int *devCircleLists, int *devListStarts, int *devListEnds) {
     int pixelX = blockDim.x * blockIdx.x + threadIdx.x;
     int pixelY = blockDim.y * blockIdx.y + threadIdx.y;
 
     if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
         return;
-    
-    int tileIdx = blockIdx.y * tileNumX + blockIdx.x;
-    int listLength = devListsLength[tileIdx];
-    int *list = devLists + cuConstRendererParams.numCircles * tileIdx;
+
+    int tileIdx = blockIdx.y * numTileX + blockIdx.x;
+    int listStart = devListStarts[tileIdx];
+    int listEnd = devListEnds[tileIdx];
 
     float invWidth = 1.f / cuConstRendererParams.imageWidth;
     float invHeight = 1.f / cuConstRendererParams.imageHeight;
@@ -545,22 +599,33 @@ __global__ void kernelBlendPixels(int tileNumX, int *devLists, int *devListsLeng
 
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
 
-    for (int i = 0; i < listLength; i++) {
-        int index3 = list[i]*3;
+    for (int i = listStart; i < listEnd; i++) {
+        int circleIdx = devCircleLists[i];
+        int index3 = circleIdx*3;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        shadePixel(list[i], pixelCenterNorm, p, imgPtr);
+        shadePixel(circleIdx, pixelCenterNorm, p, imgPtr);
     }
 }
 
-// Helper struct for thrust
-struct IndexToTile {
-    int numCircles;
+__global__ void kernelMakeTileRanges(const int *devTileLists, int *devListStarts, int *devListEnds, int totalPair) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    __host__ __device__
-    int operator()(int index) const {
-        return index / numCircles;
+    if (i >= totalPair)
+        return;
+
+    int tileIdx = devTileLists[i];
+
+    // segment start
+    if (i == 0 || devTileLists[i - 1] != tileIdx) {
+        devListStarts[tileIdx] = i;
     }
-};
+
+    // segment end, exclusive
+    if (i == totalPair - 1 || devTileLists[i + 1] != tileIdx) {
+        devListEnds[tileIdx] = i + 1;
+    }
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -581,10 +646,10 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceImageData = NULL;
 
     // my code
-    devFlags = NULL;
-    devScan = NULL;
-    devLists = NULL;
-    devListsLength = NULL;
+    // devFlags = NULL;
+    // devScan = NULL;
+    // devLists = NULL;
+    // devListsLength = NULL;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -606,10 +671,13 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
-        cudaFree(devFlags);
-        cudaFree(devScan);
-        cudaFree(devLists);
-        cudaFree(devListsLength);
+        // cudaFree(devFlags);
+        // cudaFree(devScan);
+        // cudaFree(devLists);
+        // cudaFree(devListsLength);
+        cudaFree(devTileCount);
+        cudaFree(devListStarts);
+        cudaFree(devListEnds);
     }
 }
 
@@ -657,7 +725,7 @@ CudaRenderer::setup() {
         printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
     }
     printf("---------------------------------------------------------\n");
-    
+
     // By this time the scene should be loaded.  Now copy all the key
     // data structures into device memory so they are accessible to
     // CUDA kernels
@@ -677,14 +745,19 @@ CudaRenderer::setup() {
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
 
     // my code
+    // int numTiles = ((image->width + TILE_SIZE - 1) / TILE_SIZE) * ((image->height + TILE_SIZE - 1) / TILE_SIZE);
+    // size_t total =
+    // static_cast<size_t>(numTiles) *
+    // static_cast<size_t>(numCircles);
+    // cudaCheckError(cudaMalloc((void **)&devFlags, total * sizeof(int)));
+    // cudaCheckError(cudaMalloc(&devScan, total * sizeof(int)));
+    // cudaCheckError(cudaMalloc(&devLists, total * sizeof(int)));
+    // cudaCheckError(cudaMalloc(&devListsLength, numTiles * sizeof(int)));
+
     int numTiles = ((image->width + TILE_SIZE - 1) / TILE_SIZE) * ((image->height + TILE_SIZE - 1) / TILE_SIZE);
-    size_t total =
-    static_cast<size_t>(numTiles) *
-    static_cast<size_t>(numCircles);
-    cudaCheckError(cudaMalloc((void **)&devFlags, total * sizeof(int)));
-    cudaCheckError(cudaMalloc(&devScan, total * sizeof(int)));
-    cudaCheckError(cudaMalloc(&devLists, total * sizeof(int)));
-    cudaCheckError(cudaMalloc(&devListsLength, numTiles * sizeof(int)));
+    cudaCheckError(cudaMalloc((void **)&devTileCount, (numCircles+1)*sizeof(int)));
+    cudaCheckError(cudaMalloc((void **)&devListStarts, numTiles*sizeof(int)));
+    cudaCheckError(cudaMalloc((void **)&devListEnds, numTiles*sizeof(int)));
 
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
@@ -808,72 +881,77 @@ CudaRenderer::render() {
     dim3 stg2GridDim((image->width + stg2BlockDim.x - 1) / stg2BlockDim.x,
      (image->height + stg2BlockDim.y - 1) / stg2BlockDim.y);
     // 别名
-    dim3 &tileNum = stg2GridDim;
-    int tileNumInt = tileNum.x*tileNum.y;
+    dim3 &numTile = stg2GridDim;
 
-    // stage 1: find circles intersecting with each tile
-    // make flag
-    // 注意这里 xyz 顺序，x是circleIdx，y是tileX，z是tileY
-    // 这样做是因为 z 轴 thread 数量不允许超过 64（4060）
-    dim3 stg1BlockDim(256, 1, 1);
-    dim3 stg1GridDim((numCircles + stg1BlockDim.x - 1) / stg1BlockDim.x, tileNum.x, tileNum.y);
+    // stage 1
+    dim3 circleBlockDim(256);
+    dim3 circlePlusOneGridDim((numCircles + circleBlockDim.x) / circleBlockDim.x);
+    dim3 circleGridDim((numCircles + circleBlockDim.x - 1) / circleBlockDim.x);
 
-    double kernel_startTime = CycleTimer::currentSeconds();
-    kernelMakeFlags<<<stg1GridDim, stg1BlockDim>>>(tileNum.x, tileSize, devFlags);
-    cudaDeviceSynchronize();
-    double kernel_endTime = CycleTimer::currentSeconds();
-    printf("[kernelMakeFlags] elapsed time: %f ms\n", (kernel_endTime - kernel_startTime) * 1000);
+    // double kernelStart = CycleTimer::currentSeconds();
+    kernelMakeTileCount<<<circlePlusOneGridDim, circleBlockDim>>>(devTileCount);
+    // cudaDeviceSynchronize();
+    // double kernelEnd = CycleTimer::currentSeconds();
+    // printf("Kernel MakeTileCount execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
-    // segmented scan
-    thrust::device_ptr<int> flags(devFlags);
-    thrust::device_ptr<int> scan(devScan);
-    auto countingBegin =
-        thrust::make_counting_iterator<int>(0);
-    auto keysBegin =
-        thrust::make_transform_iterator(
-            countingBegin,
-            IndexToTile{numCircles}
-        );
 
-    int numTiles = tileNum.x * tileNum.y;
-    size_t total =
-    static_cast<size_t>(numTiles) *
-    static_cast<size_t>(numCircles);
+    thrust::device_ptr<int> tileCountOffsets(devTileCount);
 
-    kernel_startTime = CycleTimer::currentSeconds();
-    thrust::exclusive_scan_by_key(
-        keysBegin,
-        keysBegin + total,
-        flags,
-        scan
-    );
-    cudaDeviceSynchronize();
-    kernel_endTime = CycleTimer::currentSeconds();
-    printf("[thrust::exclusive_scan_by_key] elapsed time: %f ms\n", (kernel_endTime - kernel_startTime) * 1000);
+    // kernelStart = CycleTimer::currentSeconds();
+    thrust::inclusive_scan(tileCountOffsets, tileCountOffsets + numCircles + 1, tileCountOffsets);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Thrust InclusiveScan execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
-    // making lists
+    int *devTileOffsets = devTileCount;
+    int totalPair;
 
-    kernel_startTime = CycleTimer::currentSeconds();
-    kernelMakeLists<<<stg1GridDim, stg1BlockDim>>>(tileNum.x, devFlags, devScan, devLists);
-    cudaDeviceSynchronize();
-    kernel_endTime = CycleTimer::currentSeconds();
-    printf("[kernelMakeLists] elapsed time: %f ms\n", (kernel_endTime - kernel_startTime) * 1000);
+    // kernelStart = CycleTimer::currentSeconds();
+    cudaMemcpy(&totalPair, devTileOffsets + numCircles, sizeof(int), cudaMemcpyDeviceToHost);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Memcpy totalPair execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
-    dim3 listsLengthBlockDim(256);
-    dim3 listsLengthGridDim((tileNumInt+listsLengthBlockDim.x-1)/listsLengthBlockDim.x);
+    int *devTileLists;
+    int *devCircleLists;
+    // 这里内存大小是前一步的结果
+    // 最后可以考虑在 setup 里面放一个足够大的 buffer 做 workspace。
+    cudaCheckError(cudaMalloc((void **)&devTileLists, totalPair*sizeof(int)));
+    cudaCheckError(cudaMalloc((void **)&devCircleLists, totalPair*sizeof(int)));
 
-    kernel_startTime = CycleTimer::currentSeconds();
-    kernelMakeListsLength<<<listsLengthGridDim, listsLengthBlockDim>>>(tileNumInt, devFlags, devScan, devListsLength);
-    cudaDeviceSynchronize();
-    kernel_endTime = CycleTimer::currentSeconds();
-    printf("[kernelMakeListsLength] elapsed time: %f ms\n", (kernel_endTime - kernel_startTime) * 1000);
+    // kernelStart = CycleTimer::currentSeconds();
+    kernelWritePairs<<<circleGridDim, circleBlockDim>>>(devTileLists, devCircleLists, devTileOffsets, numTile.x);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Kernel WritePairs execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+
+    thrust::device_ptr<int> tileBegin(devTileLists);
+    thrust::device_ptr<int> circleBegin(devCircleLists);
+
+    // kernelStart = CycleTimer::currentSeconds();
+    thrust::stable_sort_by_key(tileBegin, tileBegin + totalPair, circleBegin);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Thrust StableSort execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+
+    dim3 pairBlockDim(256);
+    dim3 pairGridDim((totalPair + pairBlockDim.x - 1) / pairBlockDim.x);
+    // kernelStart = CycleTimer::currentSeconds();
+    kernelMakeTileRanges<<<pairGridDim, pairBlockDim>>>(devTileLists, devListStarts, devListEnds, totalPair);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Kernel MakeTileRanges execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+
+
+    // 后面 devTileLists 就用不到了，可以释放内存
+    cudaFree(devTileLists);
+
 
     // stage 2: for each pixel, blend intersecting circles with corresponding tile
-
-    kernel_startTime = CycleTimer::currentSeconds();
-    kernelBlendPixels<<<stg2GridDim, stg2BlockDim>>>(tileNum.x, devLists, devListsLength);
-    cudaDeviceSynchronize();
-    kernel_endTime = CycleTimer::currentSeconds();
-    printf("[kernelBlendPixels] elapsed time: %f ms\n", (kernel_endTime - kernel_startTime) * 1000);
-
+    // kernelStart = CycleTimer::currentSeconds();
+    kernelBlendPixelsByStartsEnds<<<stg2GridDim, stg2BlockDim>>>(numTile.x, devCircleLists, devListStarts, devListEnds);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Kernel BlendPixelsByStartsEnds execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    cudaFree(devCircleLists);
 }
