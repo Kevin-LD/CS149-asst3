@@ -730,6 +730,21 @@ CudaRenderer::setup() {
     cudaCheckError(cudaMalloc((void **)&devListStarts, numTiles*sizeof(int)));
     cudaCheckError(cudaMalloc((void **)&devListEnds, numTiles*sizeof(int)));
 
+    // A hack !!!
+    // thrust warmup
+    // SIGNIFICANTLY improves thrust performance in render for small workloads
+    int *tmp;
+    cudaMalloc(&tmp, 1024 * sizeof(int));
+
+    thrust::device_ptr<int> p(tmp);
+
+    thrust::fill(p, p + 1024, 0);
+    thrust::sort(p, p + 1024);
+
+    cudaDeviceSynchronize();
+
+    cudaFree(tmp);
+
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
     // memory here is an optimization over just sticking these values
@@ -859,59 +874,59 @@ CudaRenderer::render() {
     dim3 circlePlusOneGridDim((numCircles + circleBlockDim.x) / circleBlockDim.x);
     dim3 circleGridDim((numCircles + circleBlockDim.x - 1) / circleBlockDim.x);
 
-    double kernelStart = CycleTimer::currentSeconds();
+    // double kernelStart = CycleTimer::currentSeconds();
     kernelMakeTileCount<<<circlePlusOneGridDim, circleBlockDim>>>(devTileCount);
-    cudaDeviceSynchronize();
-    double kernelEnd = CycleTimer::currentSeconds();
-    printf("Kernel MakeTileCount execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    // cudaDeviceSynchronize();
+    // double kernelEnd = CycleTimer::currentSeconds();
+    // printf("Kernel MakeTileCount execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
 
     thrust::device_ptr<int> tileCountOffsets(devTileCount);
 
-    kernelStart = CycleTimer::currentSeconds();
+    // kernelStart = CycleTimer::currentSeconds();
     thrust::inclusive_scan(tileCountOffsets, tileCountOffsets + numCircles + 1, tileCountOffsets);
-    cudaDeviceSynchronize();
-    kernelEnd = CycleTimer::currentSeconds();
-    printf("Thrust InclusiveScan execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Thrust InclusiveScan execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
     int *devTileOffsets = devTileCount;
     int totalPair;
 
-    kernelStart = CycleTimer::currentSeconds();
+    // kernelStart = CycleTimer::currentSeconds();
     cudaMemcpy(&totalPair, devTileOffsets + numCircles, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
-    kernelEnd = CycleTimer::currentSeconds();
-    printf("Memcpy totalPair execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Memcpy totalPair execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
     int *devTileLists;
     int *devCircleLists;
     // 这里内存大小是前一步的结果
-    // 最后可以考虑在 setup 里面放一个足够大的 buffer 做 workspace。
+    // 可以考虑在 setup 里面放一个足够大的 buffer 做 workspace。
     cudaCheckError(cudaMalloc((void **)&devTileLists, totalPair*sizeof(int)));
     cudaCheckError(cudaMalloc((void **)&devCircleLists, totalPair*sizeof(int)));
 
-    kernelStart = CycleTimer::currentSeconds();
+    // kernelStart = CycleTimer::currentSeconds();
     kernelWritePairs<<<circleGridDim, circleBlockDim>>>(devTileLists, devCircleLists, devTileOffsets, numTile.x);
-    cudaDeviceSynchronize();
-    kernelEnd = CycleTimer::currentSeconds();
-    printf("Kernel WritePairs execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Kernel WritePairs execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
     thrust::device_ptr<int> tileBegin(devTileLists);
     thrust::device_ptr<int> circleBegin(devCircleLists);
 
-    kernelStart = CycleTimer::currentSeconds();
+    // kernelStart = CycleTimer::currentSeconds();
     thrust::stable_sort_by_key(tileBegin, tileBegin + totalPair, circleBegin);
-    cudaDeviceSynchronize();
-    kernelEnd = CycleTimer::currentSeconds();
-    printf("Thrust StableSort execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Thrust StableSort execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
     dim3 pairBlockDim(256);
     dim3 pairGridDim((totalPair + pairBlockDim.x - 1) / pairBlockDim.x);
-    kernelStart = CycleTimer::currentSeconds();
+    // kernelStart = CycleTimer::currentSeconds();
     kernelMakeTileRanges<<<pairGridDim, pairBlockDim>>>(devTileLists, devListStarts, devListEnds, totalPair);
-    cudaDeviceSynchronize();
-    kernelEnd = CycleTimer::currentSeconds();
-    printf("Kernel MakeTileRanges execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    // cudaDeviceSynchronize();
+    // kernelEnd = CycleTimer::currentSeconds();
+    // printf("Kernel MakeTileRanges execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
 
     // 后面 devTileLists 就用不到了，可以释放内存
