@@ -49,6 +49,9 @@ inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=
 
 #define TILE_SIZE 16
 
+// shared memory chunck size, MUST EQUAL TO NUMBER OF PIXELS IN TILE
+#define CHUNCK (TILE_SIZE*TILE_SIZE)
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -352,21 +355,22 @@ __global__ void kernelAdvanceSnowflake() {
 // given a pixel and a circle, determines the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
-__device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+// My alteration: input existingColor; output newColor
+// Reduce global memory access
+template  <bool isSnow>
+__device__ __inline__ float4
+shadePixel(float2 pixelCenter, float3 p, float rad, float3 rgb, float4 existingColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
     if (pixelDist > maxDist)
-        return;
+        return existingColor;
 
-    float3 rgb;
     float alpha;
 
     // there is a non-zero contribution.  Now compute the shading value
@@ -377,7 +381,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // would be wise to perform this logic outside of the loop next in
     // kernelRenderCircles.  (If feeling good about yourself, you
     // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+    if constexpr (isSnow) {
 
         const float kCircleMaxAlpha = .5f;
         const float falloffScale = 4.f;
@@ -390,76 +394,18 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
     } else {
-        // simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
     }
 
     float oneMinusAlpha = 1.f - alpha;
 
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
-
-    float4 existingColor = *imagePtr;
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
 
-    // global memory write
-    *imagePtr = newColor;
-
-    // END SHOULD-BE-ATOMIC REGION
-}
-
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= cuConstRendererParams.numCircles)
-        return;
-
-    int index3 = 3 * index;
-
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
-
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
-        }
-    }
+    return newColor;
 }
 
 // My code
@@ -504,8 +450,8 @@ __global__ void kernelMakeTileCount(int *devTileCount) {
     short maxTileIdxX = (screenMaxX + TILE_SIZE - 1) / TILE_SIZE;;
     short maxTileIdxY = (screenMaxY + TILE_SIZE - 1) / TILE_SIZE;
 
-    float invWidth = 1.f / cuConstRendererParams.imageWidth;
-    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
 
     int count = 0;
 
@@ -559,8 +505,8 @@ __global__ void kernelWritePairs(int *devTileLists, int *devCircleLists, int *de
     short maxTileIdxX = (screenMaxX + TILE_SIZE - 1) / TILE_SIZE;;
     short maxTileIdxY = (screenMaxY + TILE_SIZE - 1) / TILE_SIZE;
 
-    float invWidth = 1.f / cuConstRendererParams.imageWidth;
-    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
 
     int base = devTileOffSets[circleIdx];
 
@@ -579,31 +525,67 @@ __global__ void kernelWritePairs(int *devTileLists, int *devCircleLists, int *de
     }
 }
 
-
+template <bool isSnow>
 __global__ void kernelBlendPixelsByStartsEnds(int numTileX, int *devCircleLists, int *devListStarts, int *devListEnds) {
     int pixelX = blockDim.x * blockIdx.x + threadIdx.x;
     int pixelY = blockDim.y * blockIdx.y + threadIdx.y;
 
-    if (pixelX >= cuConstRendererParams.imageWidth || pixelY >= cuConstRendererParams.imageHeight)
-        return;
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+
+    // 后面还需要用 thread 来读写
+    // if (pixelX >= imageWidth || pixelY >= imageHeight)
+    //     return;
+    bool validPixel = pixelX < imageWidth && pixelY < imageHeight;
+    float2 pixelCenterNorm;
+    float4* imgPtr = nullptr;
+    float4 existingColor;
 
     int tileIdx = blockIdx.y * numTileX + blockIdx.x;
     int listStart = devListStarts[tileIdx];
     int listEnd = devListEnds[tileIdx];
 
-    float invWidth = 1.f / cuConstRendererParams.imageWidth;
-    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
 
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
+    if (validPixel) {
+        pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f), invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
+        imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+        existingColor = *imgPtr;
+    }
 
-    for (int i = listStart; i < listEnd; i++) {
-        int circleIdx = devCircleLists[i];
-        int index3 = circleIdx*3;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        shadePixel(circleIdx, pixelCenterNorm, p, imgPtr);
+    int length = listEnd - listStart;
+    int threadIdxInBlock = threadIdx.y * TILE_SIZE + threadIdx.x;
+    __shared__ float3 p[CHUNCK];
+    __shared__ float rad[CHUNCK];
+    __shared__ float3 rgb[CHUNCK];
+
+    int chunkNum = (length + CHUNCK - 1)/CHUNCK;
+
+    for (int j = 0; j < chunkNum; j++) {
+        int chunckStart = j * CHUNCK;
+        int index = chunckStart + threadIdxInBlock;
+        int actualChunck = min(CHUNCK, length - chunckStart);
+        if (index < length) {
+            int circleIdx = devCircleLists[listStart + index];
+            int circleIdx3 = circleIdx*3;
+            p[threadIdxInBlock] = *(float3*)(&cuConstRendererParams.position[circleIdx3]);
+            rad[threadIdxInBlock] = cuConstRendererParams.radius[circleIdx];
+            rgb[threadIdxInBlock] = *(float3*)&(cuConstRendererParams.color[circleIdx3]);
+        }
+        __syncthreads();
+        if (validPixel) {
+            for (int i = 0; i < actualChunck; i++) {
+                float4 newColor = shadePixel<isSnow>(pixelCenterNorm, p[i], rad[i], rgb[i], existingColor);
+                existingColor = newColor;
+            }
+        }
+        __syncthreads();
+    }
+    // only 1 global memory access
+    if (validPixel) {
+        *imgPtr = existingColor;
     }
 }
 
@@ -671,10 +653,7 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
-        // cudaFree(devFlags);
-        // cudaFree(devScan);
-        // cudaFree(devLists);
-        // cudaFree(devListsLength);
+        // my code
         cudaFree(devTileCount);
         cudaFree(devListStarts);
         cudaFree(devListEnds);
@@ -745,14 +724,6 @@ CudaRenderer::setup() {
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
 
     // my code
-    // int numTiles = ((image->width + TILE_SIZE - 1) / TILE_SIZE) * ((image->height + TILE_SIZE - 1) / TILE_SIZE);
-    // size_t total =
-    // static_cast<size_t>(numTiles) *
-    // static_cast<size_t>(numCircles);
-    // cudaCheckError(cudaMalloc((void **)&devFlags, total * sizeof(int)));
-    // cudaCheckError(cudaMalloc(&devScan, total * sizeof(int)));
-    // cudaCheckError(cudaMalloc(&devLists, total * sizeof(int)));
-    // cudaCheckError(cudaMalloc(&devListsLength, numTiles * sizeof(int)));
 
     int numTiles = ((image->width + TILE_SIZE - 1) / TILE_SIZE) * ((image->height + TILE_SIZE - 1) / TILE_SIZE);
     cudaCheckError(cudaMalloc((void **)&devTileCount, (numCircles+1)*sizeof(int)));
@@ -888,29 +859,29 @@ CudaRenderer::render() {
     dim3 circlePlusOneGridDim((numCircles + circleBlockDim.x) / circleBlockDim.x);
     dim3 circleGridDim((numCircles + circleBlockDim.x - 1) / circleBlockDim.x);
 
-    // double kernelStart = CycleTimer::currentSeconds();
+    double kernelStart = CycleTimer::currentSeconds();
     kernelMakeTileCount<<<circlePlusOneGridDim, circleBlockDim>>>(devTileCount);
-    // cudaDeviceSynchronize();
-    // double kernelEnd = CycleTimer::currentSeconds();
-    // printf("Kernel MakeTileCount execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    cudaDeviceSynchronize();
+    double kernelEnd = CycleTimer::currentSeconds();
+    printf("Kernel MakeTileCount execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
 
     thrust::device_ptr<int> tileCountOffsets(devTileCount);
 
-    // kernelStart = CycleTimer::currentSeconds();
+    kernelStart = CycleTimer::currentSeconds();
     thrust::inclusive_scan(tileCountOffsets, tileCountOffsets + numCircles + 1, tileCountOffsets);
-    // cudaDeviceSynchronize();
-    // kernelEnd = CycleTimer::currentSeconds();
-    // printf("Thrust InclusiveScan execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    cudaDeviceSynchronize();
+    kernelEnd = CycleTimer::currentSeconds();
+    printf("Thrust InclusiveScan execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
     int *devTileOffsets = devTileCount;
     int totalPair;
 
-    // kernelStart = CycleTimer::currentSeconds();
+    kernelStart = CycleTimer::currentSeconds();
     cudaMemcpy(&totalPair, devTileOffsets + numCircles, sizeof(int), cudaMemcpyDeviceToHost);
-    // cudaDeviceSynchronize();
-    // kernelEnd = CycleTimer::currentSeconds();
-    // printf("Memcpy totalPair execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    cudaDeviceSynchronize();
+    kernelEnd = CycleTimer::currentSeconds();
+    printf("Memcpy totalPair execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
     int *devTileLists;
     int *devCircleLists;
@@ -919,28 +890,28 @@ CudaRenderer::render() {
     cudaCheckError(cudaMalloc((void **)&devTileLists, totalPair*sizeof(int)));
     cudaCheckError(cudaMalloc((void **)&devCircleLists, totalPair*sizeof(int)));
 
-    // kernelStart = CycleTimer::currentSeconds();
+    kernelStart = CycleTimer::currentSeconds();
     kernelWritePairs<<<circleGridDim, circleBlockDim>>>(devTileLists, devCircleLists, devTileOffsets, numTile.x);
-    // cudaDeviceSynchronize();
-    // kernelEnd = CycleTimer::currentSeconds();
-    // printf("Kernel WritePairs execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    cudaDeviceSynchronize();
+    kernelEnd = CycleTimer::currentSeconds();
+    printf("Kernel WritePairs execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
     thrust::device_ptr<int> tileBegin(devTileLists);
     thrust::device_ptr<int> circleBegin(devCircleLists);
 
-    // kernelStart = CycleTimer::currentSeconds();
+    kernelStart = CycleTimer::currentSeconds();
     thrust::stable_sort_by_key(tileBegin, tileBegin + totalPair, circleBegin);
-    // cudaDeviceSynchronize();
-    // kernelEnd = CycleTimer::currentSeconds();
-    // printf("Thrust StableSort execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    cudaDeviceSynchronize();
+    kernelEnd = CycleTimer::currentSeconds();
+    printf("Thrust StableSort execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
     dim3 pairBlockDim(256);
     dim3 pairGridDim((totalPair + pairBlockDim.x - 1) / pairBlockDim.x);
-    // kernelStart = CycleTimer::currentSeconds();
+    kernelStart = CycleTimer::currentSeconds();
     kernelMakeTileRanges<<<pairGridDim, pairBlockDim>>>(devTileLists, devListStarts, devListEnds, totalPair);
-    // cudaDeviceSynchronize();
-    // kernelEnd = CycleTimer::currentSeconds();
-    // printf("Kernel MakeTileRanges execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
+    cudaDeviceSynchronize();
+    kernelEnd = CycleTimer::currentSeconds();
+    printf("Kernel MakeTileRanges execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
 
 
     // 后面 devTileLists 就用不到了，可以释放内存
@@ -949,7 +920,10 @@ CudaRenderer::render() {
 
     // stage 2: for each pixel, blend intersecting circles with corresponding tile
     // kernelStart = CycleTimer::currentSeconds();
-    kernelBlendPixelsByStartsEnds<<<stg2GridDim, stg2BlockDim>>>(numTile.x, devCircleLists, devListStarts, devListEnds);
+    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME)
+        kernelBlendPixelsByStartsEnds<true><<<stg2GridDim, stg2BlockDim>>>(numTile.x, devCircleLists, devListStarts, devListEnds);
+    else
+        kernelBlendPixelsByStartsEnds<false><<<stg2GridDim, stg2BlockDim>>>(numTile.x, devCircleLists, devListStarts, devListEnds);
     // cudaDeviceSynchronize();
     // kernelEnd = CycleTimer::currentSeconds();
     // printf("Kernel BlendPixelsByStartsEnds execution time: %f ms\n", (kernelEnd - kernelStart) * 1000);
