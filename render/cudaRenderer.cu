@@ -49,8 +49,8 @@ inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=
 
 #define TILE_SIZE 16
 
-// shared memory chunck size, MUST EQUAL TO NUMBER OF PIXELS IN TILE
-#define CHUNCK (TILE_SIZE*TILE_SIZE)
+// shared memory chunk size, MUST EQUAL TO NUMBER OF PIXELS IN TILE
+#define CHUNK (TILE_SIZE*TILE_SIZE)
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -557,16 +557,16 @@ __global__ void kernelBlendPixelsByStartsEnds(int numTileX, int *devCircleLists,
 
     int length = listEnd - listStart;
     int threadIdxInBlock = threadIdx.y * TILE_SIZE + threadIdx.x;
-    __shared__ float3 p[CHUNCK];
-    __shared__ float rad[CHUNCK];
-    __shared__ float3 rgb[CHUNCK];
+    __shared__ float3 p[CHUNK];
+    __shared__ float rad[CHUNK];
+    __shared__ float3 rgb[CHUNK];
 
-    int chunkNum = (length + CHUNCK - 1)/CHUNCK;
+    int chunkNum = (length + CHUNK - 1)/CHUNK;
 
     for (int j = 0; j < chunkNum; j++) {
-        int chunckStart = j * CHUNCK;
-        int index = chunckStart + threadIdxInBlock;
-        int actualChunck = min(CHUNCK, length - chunckStart);
+        int chunkStart = j * CHUNK;
+        int index = chunkStart + threadIdxInBlock;
+        int actualchunk = min(CHUNK, length - chunkStart);
         if (index < length) {
             int circleIdx = devCircleLists[listStart + index];
             int circleIdx3 = circleIdx*3;
@@ -576,7 +576,7 @@ __global__ void kernelBlendPixelsByStartsEnds(int numTileX, int *devCircleLists,
         }
         __syncthreads();
         if (validPixel) {
-            for (int i = 0; i < actualChunck; i++) {
+            for (int i = 0; i < actualchunk; i++) {
                 float4 newColor = shadePixel<isSnow>(pixelCenterNorm, p[i], rad[i], rgb[i], existingColor);
                 existingColor = newColor;
             }
